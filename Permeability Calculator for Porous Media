@@ -1,0 +1,103 @@
+# Import necessary libraries
+import numpy as np             # For numerical operations
+import openpnm as op          # For pore network modeling
+import porespy as ps          # For image-based pore network extraction
+import os                    # For file and directory operations
+
+def calculate_permeability(raw_file, sample_size, voxel_size):  # Added voxel_size as argument
+    """Calculates the effective permeability of a sample from a raw file.
+
+    Args:
+        raw_file (str): The path to the raw micro-CT scan file.
+        sample_size (tuple): Dimensions of the sample (x, y, z) in voxels.  
+                              **User must provide this information.**
+        voxel_size (float): The size of each voxel in meters.  
+                            **User must provide this information.**
+    """
+
+    # Load raw micro-CT data
+    with open(raw_file, 'rb') as f:  
+        im = np.fromfile(f, dtype=np.uint8).reshape(sample_size)  
+    im = im == 0  
+
+    # Generate SNOW pore network
+    snow_results = ps.networks.snow2(im, voxel_size=voxel_size)  # Use voxel_size for scaling
+    snow_network = snow_results.network 
+
+    # Create OpenPNM network from SNOW network
+    pn = op.network.Network()  
+    pn.update({
+        'pore.coords': snow_network['pore.coords'],  
+        'throat.conns': snow_network['throat.conns'] 
+    })
+    print(f"Number of pores in the network: {pn.Np}") 
+
+    # Geometry and Phase (Add pore diameter model)
+    air = op.phase.Air(network=pn)      
+    air['pore.viscosity'] = 1.8e-5  
+
+    # Stokes Flow (Adjusted boundary conditions)
+    sf = op.algorithms.StokesFlow(network=pn, phase=air) 
+
+    # Find and analyze isolated clusters (User will need to inspect this output)
+    pn.add_model(propname='pore.cluster_number', model=op.models.network.cluster_number)  
+    pn.add_model(propname='pore.cluster_size', model=op.models.network.cluster_size)      
+
+    # Add hydraulic conductance model
+    pn.add_model(propname='pore.diameter', model=op.models.geometry.pore_size.largest_sphere, iters=10)
+    pn.add_model(propname='throat.diameter', model=op.models.geometry.throat_size.from_neighbor_pores)
+    pn.add_model(propname='throat.hydraulic_size_factors', model=op.models.geometry.hydraulic_size_factors.spheres_and_cylinders)
+    air.add_model(propname='throat.hydraulic_conductance', model=op.models.physics.hydraulic_conductance.hagen_poiseuille)
+
+    print(pn)
+    print(pn['pore.cluster_number'])
+    print(pn['pore.cluster_size'])
+
+    # Write cluster information to file for user inspection
+    with open('cluster_info.txt', 'w') as f:
+        f.write("Cluster numbers:\n")
+        f.write(np.array2string(pn['pore.cluster_number'], threshold=np.inf))
+        f.write("\nCluster sizes:\n")
+        f.write(np.array2string(pn['pore.cluster_size'], threshold=np.inf))
+
+    # --- USER ACTION REQUIRED HERE ---
+    # Inspect 'cluster_info.txt' and determine the largest cluster size.
+    # Replace '2534' below with the actual largest cluster size you found.
+    Ps = pn['pore.cluster_size'] < 2534   
+    op.topotools.trim(network=pn, pores=Ps) # Remove small clusters
+
+    # Label inlet and outlet pores for flow simulation
+    left_pores = pn.coords[:, 0] == pn.coords[:, 0].min()
+    pn["pore.left"] = left_pores
+    right_pores = pn.coords[:, 0] == pn.coords[:, 0].max()
+    pn["pore.right"] = right_pores
+    sf.set_value_BC(pores=pn.pores("left"), values=1)  
+    sf.set_value_BC(pores=pn.pores("right"), values=0)  
+    sf.run()
+
+    # Calculate permeability based on flow simulation results
+    outlets = pn.pores("right") 
+    Q = sf.rate(pores=outlets)   
+
+    # Calculate cross-sectional area and length based on voxel size and sample dimensions
+    A = sample_size[1] * sample_size[2] * voxel_size**2  # Cross-sectional area in m^2
+    L = sample_size[0] * voxel_size                      # Length in m
+
+    mu = air['pore.viscosity'].mean()  
+    K = Q * mu * L / A           
+
+    return K
+
+# Define input parameters
+sample_size = (200, 200, 200)        # User provides sample dimensions
+voxel_size = 7.6e-6                 # User provides voxel size (in meters)
+output_prefix = "sample"
+high_value_samples = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+# Open the text file to write the results
+with open("permeability_results.txt", "w") as f:
+    for i in high_value_samples:
+        raw_file = f"{output_prefix}_{i}.raw"
+        if os.path.exists(raw_file):
+            K = calculate_permeability(raw_file, sample_size, voxel_size) 
+            f.write(f"Sample {i} Permeability: {K}\n") 
